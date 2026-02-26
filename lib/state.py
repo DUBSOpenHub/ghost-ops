@@ -107,6 +107,18 @@ class StateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # Idempotent migration: add A/B testing columns to mutations table
+        for _col_sql in [
+            "ALTER TABLE mutations ADD COLUMN ab_score_original REAL",
+            "ALTER TABLE mutations ADD COLUMN ab_score_mutated REAL",
+            "ALTER TABLE mutations ADD COLUMN ab_task TEXT",
+            "ALTER TABLE mutations ADD COLUMN ab_winner TEXT",
+        ]:
+            try:
+                self._conn.execute(_col_sql)
+            except sqlite3.OperationalError:
+                pass
+        self._conn.commit()
         logger.debug("StateStore opened: %s", self._db_path)
 
     def close(self) -> None:
@@ -258,6 +270,10 @@ class StateStore:
         validators: list[str],
         consensus: str,
         deployed: bool = False,
+        ab_score_original: float | None = None,
+        ab_score_mutated: float | None = None,
+        ab_task: str | None = None,
+        ab_winner: str | None = None,
     ) -> int:
         v1 = validators[0] if len(validators) > 0 else None
         v2 = validators[1] if len(validators) > 1 else None
@@ -265,9 +281,11 @@ class StateStore:
         rows = await self.execute(
             """INSERT INTO mutations
                (agent_id, original_hash, mutated_hash, mutation_type,
-                validator_1, validator_2, validator_3, consensus, deployed)
-               VALUES (?,?,?,?,?,?,?,?,?) RETURNING id""",
-            (agent_id, original_hash, mutated_hash, mutation_type, v1, v2, v3, consensus, deployed),
+                validator_1, validator_2, validator_3, consensus, deployed,
+                ab_score_original, ab_score_mutated, ab_task, ab_winner)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",
+            (agent_id, original_hash, mutated_hash, mutation_type, v1, v2, v3, consensus, deployed,
+             ab_score_original, ab_score_mutated, ab_task, ab_winner),
         )
         return rows[0]["id"]
 
