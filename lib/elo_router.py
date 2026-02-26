@@ -49,6 +49,7 @@ class ELORouter:
 
     def invalidate_cache(self) -> None:
         """Force a reload on the next call."""
+        self._cached_ranking = []
         self._cache_loaded_at = 0.0
 
     # ------------------------------------------------------------------
