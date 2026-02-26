@@ -24,7 +24,7 @@ auto_close_stale_days = 30
 
 [missions.fleet_evolution]
 enabled = true
-schedule = "0 */4 * * *"
+schedule = "0 */2 * * *"
 evolution_batch_size = 3
 consensus_threshold = 2
 validator_models = ["claude-opus-4.6", "gpt-5.2", "claude-sonnet-4.6"]
