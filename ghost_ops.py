@@ -334,16 +334,24 @@ class GhostOps:
             dry_run=self.dry_run,
         )
         log.info("Mission started (run_id=%d)", run_id)
+        self.llm.reset_token_counters()
         try:
             results = await module.run(ctx)
+            tokens_in, tokens_out = self.llm.reset_token_counters()
             await self.store.record_run_finish(
-                run_id, mission_id, "success", results=results
+                run_id, mission_id, "success",
+                tokens_in=tokens_in, tokens_out=tokens_out,
+                results=results,
             )
-            log.info("Mission completed (run_id=%d) results=%s", run_id, results)
+            log.info("Mission completed (run_id=%d) tokens_in=%d tokens_out=%d results=%s",
+                     run_id, tokens_in, tokens_out, results)
         except Exception as exc:
+            tokens_in, tokens_out = self.llm.reset_token_counters()
             log.exception("Mission failed (run_id=%d): %s", run_id, exc)
             await self.store.record_run_finish(
-                run_id, mission_id, "failed", error=str(exc)
+                run_id, mission_id, "failed",
+                tokens_in=tokens_in, tokens_out=tokens_out,
+                error=str(exc),
             )
 
     # ------------------------------------------------------------------

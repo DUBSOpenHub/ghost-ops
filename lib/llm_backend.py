@@ -42,6 +42,27 @@ class LLMBackend:
         self.dry_run = dry_run
         self._primary = primary
         self._fallback = fallback
+        self._total_tokens_in: int = 0
+        self._total_tokens_out: int = 0
+
+    # ------------------------------------------------------------------
+    # Token accounting
+    # ------------------------------------------------------------------
+
+    @property
+    def total_tokens_in(self) -> int:
+        return self._total_tokens_in
+
+    @property
+    def total_tokens_out(self) -> int:
+        return self._total_tokens_out
+
+    def reset_token_counters(self) -> tuple[int, int]:
+        """Reset counters and return (tokens_in, tokens_out) accumulated so far."""
+        tin, tout = self._total_tokens_in, self._total_tokens_out
+        self._total_tokens_in = 0
+        self._total_tokens_out = 0
+        return tin, tout
 
     # ------------------------------------------------------------------
     # Public
@@ -64,14 +85,20 @@ class LLMBackend:
 
         # Primary: GitHub Models
         try:
-            return await self._github_models(messages, target_model, max_tokens, temperature)
+            resp = await self._github_models(messages, target_model, max_tokens, temperature)
+            self._total_tokens_in += resp.tokens_in
+            self._total_tokens_out += resp.tokens_out
+            return resp
         except Exception as exc:
             errors.append(f"github-models: {exc}")
             logger.warning("Primary LLM failed (%s), trying fallback", exc)
 
         # Fallback: Amplifier
         try:
-            return await self._amplifier(messages, target_model)
+            resp = await self._amplifier(messages, target_model)
+            self._total_tokens_in += resp.tokens_in
+            self._total_tokens_out += resp.tokens_out
+            return resp
         except Exception as exc:
             errors.append(f"amplifier: {exc}")
             logger.error("All LLM backends failed: %s", "; ".join(errors))
