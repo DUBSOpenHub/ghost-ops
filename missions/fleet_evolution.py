@@ -47,6 +47,23 @@ def _file_hash(content: str) -> str:
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
+def _sync_paired_files(agent_path: Path, content: str, ctx: Any) -> None:
+    """Sync paired file copies after an approved mutation."""
+    config = ctx.config.get("missions", {}).get("fleet_evolution", {})
+    paired_map = config.get("paired_files", {})
+    targets = paired_map.get(agent_path.name, [])
+    for target in targets:
+        dest = Path(os.path.expanduser(target))
+        if not dest.parent.exists():
+            logger.warning("[fleet_evolution] Paired target dir missing: %s", dest.parent)
+            continue
+        try:
+            dest.write_text(content, encoding="utf-8")
+            logger.info("[fleet_evolution] Synced paired file: %s", dest)
+        except OSError as exc:
+            logger.warning("[fleet_evolution] Failed to sync %s: %s", dest, exc)
+
+
 async def _xray_score(content: str, ctx: Any) -> int | None:
     """Run Agent X-Ray on content and return composite score (0-100), or None on error.
 
@@ -288,6 +305,7 @@ async def _mutate_agent(agent_path: Path, ctx: Any) -> dict[str, Any] | None:
         logger.info("[fleet_evolution] Backed up %s → %s", agent_path.name, backup_path.name)
         agent_path.write_text(mutated_content, encoding="utf-8")
         logger.info("[fleet_evolution] Applied mutation to %s (mutation_id=%d)", agent_path.name, mutation_id)
+        _sync_paired_files(agent_path, mutated_content, ctx)
     else:
         logger.info("[fleet_evolution] Mutation rejected for %s", agent_path.name)
 

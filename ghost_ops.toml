@@ -57,6 +57,13 @@ evolution_batch_size = 3
 consensus_threshold = 2
 validator_models = ["claude-opus-4.6", "gpt-5.2", "claude-sonnet-4.6"]
 
+# Paired-file registry: when a file is mutated, all its counterparts
+# are synced to match. Keys are glob-matched against the agent filename.
+[missions.fleet_evolution.paired_files]
+"havoc-hackathon.agent.md" = [
+  "~/dev/havoc-hackathon/skills/havoc-hackathon/SKILL.md",
+]
+
 [alerts]
 write_to_db = true
 create_github_issue = false
