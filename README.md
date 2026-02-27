@@ -10,7 +10,7 @@ Ghost Ops is an autonomous agent operations daemon that runs 24/7 on macOS via `
 |---------|----------|----------|
 | **Portfolio Watchdog** | Nightly | Scans your GitHub repos for security regressions, compliance drift, and activity |
 | **Inbox Autopilot** | Hourly | Triages new issues and PRs with LLM-drafted responses (human reviews before posting) |
-| **Fleet Evolution** | Daily | Mutates underperforming agent prompts, validates with 3-model consensus, deploys winners |
+| **Fleet Evolution** | Daily | Mutates underperforming agent prompts, validates with 3-model consensus, deploys winners (see [Grid Medic](#grid-medic)) |
 
 ## Architecture
 
@@ -104,6 +104,22 @@ ghost-ops/
     ├── test_elo_router.py
     └── test_state.py
 ```
+
+## Grid Medic
+
+Fleet Evolution is the daemon implementation of the **[Grid Medic](https://github.com/DUBSOpenHub/ghost-ops/blob/main/missions/fleet_evolution.py)** 🚑 pattern — a self-healing meta-agent that continuously monitors, repairs, and improves the agent fleet.
+
+| Capability | How It Works |
+|---|---|
+| **Fitness scoring** | Ranks agents by ELO performance data; lowest-fitness agents evolve first |
+| **LLM-powered mutation** | Generates improved agent prompts via configurable models |
+| **Multi-model consensus** | 2-of-3 validator models must approve before any change deploys |
+| **A/B testing** | Runs original vs. mutated prompts on the same task; blind-judges the outputs |
+| **Auto-rollback** | Re-tests deployed mutations within 24 hours; rolls back any that regress |
+| **Agent X-Ray integration** | Scores agent files with deterministic pattern matching (zero tokens) |
+| **Paired-file sync** | Keeps co-located copies (e.g., skill files) in sync after approved mutations |
+
+When used interactively via Copilot CLI, Grid Medic is available as a standalone agent (`grid-medic`) that can diagnose, improve, and validate individual agents on demand. Fleet Evolution runs the same logic autonomously on a schedule.
 
 ## Testing
 
