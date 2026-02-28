@@ -26,6 +26,8 @@ repos = [
   "DUBSOpenHub/shadow-score-spec",
   "DUBSOpenHub/soss-ai-command-center",
   "DUBSOpenHub/GitHub-Secure-security-activation-template",
+  "DUBSOpenHub/oss-radar",
+  "DUBSOpenHub/ospo-toil-tracker",
 ]
 
 [missions.inbox_autopilot]
@@ -45,6 +47,8 @@ repos = [
   "DUBSOpenHub/shadow-score-spec",
   "DUBSOpenHub/soss-ai-command-center",
   "DUBSOpenHub/GitHub-Secure-security-activation-template",
+  "DUBSOpenHub/oss-radar",
+  "DUBSOpenHub/ospo-toil-tracker",
 ]
 auto_label = true
 auto_draft = true
