@@ -18,12 +18,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from missions.sentinel import (
     Finding,
     _check_actions_health,
+    _check_agent_quality,
     _check_config_sanity,
     _check_daemon_liveness,
     _check_data_freshness,
     _check_file_drift,
+    _check_gh_auth,
     _check_secret_alignment,
+    _check_venv_health,
     _cron_interval_hours,
+    _prune_db,
     run,
 )
 
@@ -422,9 +426,128 @@ class TestSentinelRun(unittest.TestCase):
             },
         }
         result = arun(run(ctx))
-        self.assertEqual(result["checks_run"], 6)
+        self.assertEqual(result["checks_run"], 10)
         self.assertIn("findings", result)
         self.assertGreaterEqual(result["info"], 1)
+
+
+# ---------------------------------------------------------------------------
+# gh Auth Pre-flight
+# ---------------------------------------------------------------------------
+
+class TestGhAuth(unittest.TestCase):
+    def test_dry_run(self):
+        findings = arun(_check_gh_auth(True))
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "INFO")
+
+    @patch("missions.sentinel._gh_cli")
+    def test_auth_failure_is_critical(self, mock_cli):
+        async def side_effect(*args):
+            return (1, "", "not logged in")
+        mock_cli.side_effect = side_effect
+        findings = arun(_check_gh_auth(False))
+        critical = [f for f in findings if f.severity == "CRITICAL"]
+        self.assertGreaterEqual(len(critical), 1)
+        self.assertIn("not authenticated", critical[0].detail)
+
+    @patch("missions.sentinel._gh_cli")
+    def test_auth_success_clean(self, mock_cli):
+        async def side_effect(*args):
+            return (0, "Logged in to github.com as user (token has repo scope)", "")
+        mock_cli.side_effect = side_effect
+        findings = arun(_check_gh_auth(False))
+        critical = [f for f in findings if f.severity == "CRITICAL"]
+        self.assertEqual(len(critical), 0)
+
+
+# ---------------------------------------------------------------------------
+# DB Pruning
+# ---------------------------------------------------------------------------
+
+class TestDbPruning(unittest.TestCase):
+    def test_dry_run(self):
+        findings = arun(_prune_db({}, True))
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "INFO")
+
+    def test_prunes_old_runs(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = tmp.name
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.executescript("""
+                CREATE TABLE runs (
+                    id INTEGER PRIMARY KEY, mission_id TEXT, status TEXT,
+                    finished_at DATETIME
+                );
+                CREATE TABLE alerts (
+                    id INTEGER PRIMARY KEY, severity TEXT, source TEXT,
+                    title TEXT, acknowledged BOOLEAN DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            # Insert old run (100 days ago)
+            conn.execute(
+                "INSERT INTO runs (mission_id, status, finished_at) "
+                "VALUES ('test', 'success', datetime('now', '-100 days'))"
+            )
+            # Insert recent run
+            conn.execute(
+                "INSERT INTO runs (mission_id, status, finished_at) "
+                "VALUES ('test', 'success', datetime('now', '-1 day'))"
+            )
+            conn.commit()
+
+            count_before = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+            self.assertEqual(count_before, 2)
+            conn.close()
+
+            config = {"ghost_ops": {"db_path": db_path}}
+            findings = arun(_prune_db(config, False))
+
+            conn = sqlite3.connect(db_path)
+            count_after = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+            self.assertEqual(count_after, 1)  # old one pruned
+            conn.close()
+        finally:
+            os.unlink(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Agent Quality
+# ---------------------------------------------------------------------------
+
+class TestAgentQuality(unittest.TestCase):
+    def test_dry_run(self):
+        findings = arun(_check_agent_quality({}, True))
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "INFO")
+
+    def test_no_xray_skips_silently(self):
+        config = {"ghost_ops": {"agents_dir": "/nonexistent"}}
+        findings = arun(_check_agent_quality(config, False))
+        self.assertEqual(len(findings), 0)
+
+
+# ---------------------------------------------------------------------------
+# Venv Health
+# ---------------------------------------------------------------------------
+
+class TestVenvHealth(unittest.TestCase):
+    def test_dry_run(self):
+        findings = arun(_check_venv_health({}, True))
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "INFO")
+
+    def test_missing_venv_warns(self):
+        config = {"missions": {"sentinel": {"venvs": [
+            {"path": "/nonexistent/venv", "imports": ["pydantic"]}
+        ]}}}
+        findings = arun(_check_venv_health(config, False))
+        warns = [f for f in findings if f.severity == "WARN"]
+        self.assertGreaterEqual(len(warns), 1)
+        self.assertIn("not found", warns[0].detail)
 
 
 if __name__ == "__main__":

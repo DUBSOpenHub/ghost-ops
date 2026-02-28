@@ -4,25 +4,35 @@ Catches failure classes that portfolio_watchdog doesn't:
   1. GitHub Actions workflow failures (consecutive, stale crons, issue spam)
   2. Daemon liveness (mission gaps, fail_count spikes)
   3. Data freshness (tracked files going stale)
-  4. Config sanity (toml parsing, Python path, token tracking)
+  4. Config sanity (toml parsing, Python path, token tracking, venv health)
   5. File sync / drift (paired_files hash comparison, symlink integrity)
   6. Workflow-to-secret alignment (referenced secrets exist)
+  7. gh CLI auth pre-flight (catches dead tokens before any API calls)
+  8. DB pruning (auto-cleanup of old runs and alerts)
+  9. Agent quality gate (flags xray score regressions after fleet_evolution)
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
 import os
+import re
+import sqlite3
 import tomllib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Rate-limit: max concurrent gh api calls
+_API_SEMAPHORE = asyncio.Semaphore(3)
+_HEARTBEAT_PATH = Path(os.path.expanduser("~/.ghost-ops-heartbeat"))
 
 
 # ---------------------------------------------------------------------------
@@ -30,20 +40,27 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 async def _gh_api(path: str) -> dict[str, Any] | list[Any] | None:
-    """Run `gh api <path>` and return parsed JSON, or None on error."""
-    proc = await asyncio.create_subprocess_exec(
-        "gh", "api", path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        logger.debug("gh api %s failed: %s", path, stderr.decode().strip())
-        return None
-    try:
-        return json.loads(stdout.decode())
-    except json.JSONDecodeError:
-        return None
+    """Run `gh api <path>` with rate-limit throttling. Returns parsed JSON or None."""
+    async with _API_SEMAPHORE:
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "api", path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            err = stderr.decode().strip()
+            # Detect rate limiting
+            if "rate limit" in err.lower() or "403" in err:
+                logger.warning("gh api %s rate limited, backing off", path)
+                await asyncio.sleep(30)
+                return None
+            logger.debug("gh api %s failed: %s", path, err)
+            return None
+        try:
+            return json.loads(stdout.decode())
+        except json.JSONDecodeError:
+            return None
 
 
 async def _gh_cli(*args: str) -> tuple[int, str, str]:
@@ -135,7 +152,6 @@ async def _check_actions_health(
             wf_file = await _gh_api(f"repos/{repo}/contents/{wf_path}")
             has_schedule = False
             if isinstance(wf_file, dict) and wf_file.get("content"):
-                import base64
                 try:
                     content = base64.b64decode(wf_file["content"]).decode()
                     has_schedule = "schedule:" in content or "cron:" in content
@@ -365,8 +381,6 @@ async def _check_config_sanity(
     for plist_path in plist_paths:
         try:
             content = plist_path.read_text()
-            # Extract python path from plist
-            import re
             python_match = re.search(r"<string>(/[^<]*python[^<]*)</string>", content)
             if python_match:
                 python_path = python_match.group(1)
@@ -523,14 +537,12 @@ async def _check_secret_alignment(
             if not isinstance(wf_file, dict) or not wf_file.get("content"):
                 continue
 
-            import base64
             try:
                 content = base64.b64decode(wf_file["content"]).decode()
             except Exception:
                 continue
 
             # Find all ${{ secrets.X }} references
-            import re
             referenced = set(re.findall(r"\$\{\{\s*secrets\.(\w+)\s*\}\}", content))
 
             # Check for fallback patterns like: ${{ secrets.X || 'default' }}
@@ -554,6 +566,184 @@ async def _check_secret_alignment(
 
 
 # ---------------------------------------------------------------------------
+# Check 7: gh CLI Auth Pre-flight
+# ---------------------------------------------------------------------------
+
+async def _check_gh_auth(dry_run: bool) -> list[Finding]:
+    """Verify gh CLI is authenticated before any API calls."""
+    findings: list[Finding] = []
+
+    if dry_run:
+        return [Finding("INFO", "gh_auth", None, "Dry run: would check gh auth")]
+
+    rc, stdout, stderr = await _gh_cli("auth", "status", "--hostname", "github.com")
+    if rc != 0:
+        findings.append(Finding(
+            "CRITICAL", "gh_auth", None,
+            f"gh CLI not authenticated — all API-dependent missions will fail. "
+            f"Run 'gh auth login' to fix. Error: {stderr.strip()[:200]}",
+        ))
+    else:
+        # Check token scopes include repo
+        if "repo" not in stdout.lower() and "repo" not in stderr.lower():
+            findings.append(Finding(
+                "WARN", "gh_auth", None,
+                "gh CLI token may lack 'repo' scope — some API calls could fail",
+            ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Check 8: DB Pruning (auto-cleanup)
+# ---------------------------------------------------------------------------
+
+async def _prune_db(
+    config: dict[str, Any], dry_run: bool
+) -> list[Finding]:
+    """Prune old runs and acknowledged alerts to prevent unbounded DB growth."""
+    findings: list[Finding] = []
+
+    if dry_run:
+        return [Finding("INFO", "db_pruning", None, "Dry run: would prune old DB rows")]
+
+    db_path = os.path.expanduser(
+        config.get("ghost_ops", {}).get("db_path", "ghost_ops.db")
+    )
+    if not Path(db_path).exists():
+        return findings
+
+    conn = sqlite3.connect(db_path)
+
+    # Prune runs older than 90 days
+    cur = conn.execute(
+        "DELETE FROM runs WHERE finished_at < datetime('now', '-90 days')"
+    )
+    pruned_runs = cur.rowcount
+
+    # Prune acknowledged alerts older than 30 days
+    cur = conn.execute(
+        "DELETE FROM alerts WHERE acknowledged = 1 AND created_at < datetime('now', '-30 days')"
+    )
+    pruned_alerts = cur.rowcount
+
+    # Prune unacknowledged alerts older than 90 days (stale noise)
+    cur = conn.execute(
+        "DELETE FROM alerts WHERE created_at < datetime('now', '-90 days')"
+    )
+    pruned_stale_alerts = cur.rowcount
+
+    conn.commit()
+
+    # Report DB size
+    db_size_mb = Path(db_path).stat().st_size / (1024 * 1024)
+    if db_size_mb > 50:
+        findings.append(Finding(
+            "WARN", "db_pruning", None,
+            f"ghost_ops.db is {db_size_mb:.1f} MB — consider VACUUM",
+        ))
+
+    total_pruned = pruned_runs + pruned_alerts + pruned_stale_alerts
+    if total_pruned > 0:
+        findings.append(Finding(
+            "INFO", "db_pruning", None,
+            f"Pruned {pruned_runs} old runs, {pruned_alerts + pruned_stale_alerts} old alerts",
+        ))
+
+    conn.close()
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Check 9: Agent Quality Gate
+# ---------------------------------------------------------------------------
+
+async def _check_agent_quality(
+    config: dict[str, Any], dry_run: bool
+) -> list[Finding]:
+    """Check if any agent xray scores have dropped below threshold."""
+    findings: list[Finding] = []
+
+    if dry_run:
+        return [Finding("INFO", "agent_quality", None, "Dry run: would check agent quality")]
+
+    # Run agent-xray if available
+    xray_path = Path(os.path.expanduser("~/ghost-ops/agent-xray.js"))
+    if not xray_path.exists():
+        # Try alternate location
+        xray_path = Path(os.path.expanduser("~/dev/agent-xray/agent-xray.js"))
+    if not xray_path.exists():
+        return findings  # xray not available, skip silently
+
+    agents_dir = os.path.expanduser(
+        config.get("ghost_ops", {}).get("agents_dir", "~/.copilot/agents")
+    )
+    if not Path(agents_dir).exists():
+        return findings
+
+    # Scan each agent file
+    quality_threshold = 40
+    agent_files = list(Path(agents_dir).glob("*.agent.md"))
+
+    for agent_file in agent_files:
+        rc, stdout = await _shell(f"node {xray_path} {agent_file} --json 2>/dev/null")
+        if rc != 0:
+            continue
+        try:
+            result = json.loads(stdout)
+            score = result.get("composite", result.get("score", 100))
+            if score < quality_threshold:
+                findings.append(Finding(
+                    "WARN", "agent_quality", None,
+                    f"Agent '{agent_file.name}' xray score is {score} (below {quality_threshold})",
+                ))
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Check 10: Python venv health (oss-radar)
+# ---------------------------------------------------------------------------
+
+async def _check_venv_health(
+    config: dict[str, Any], dry_run: bool
+) -> list[Finding]:
+    """Verify oss-radar venv is intact and can import critical packages."""
+    findings: list[Finding] = []
+
+    if dry_run:
+        return [Finding("INFO", "venv_health", None, "Dry run: would check venv health")]
+
+    venv_paths = config.get("missions", {}).get("sentinel", {}).get("venvs", [])
+    # Default: check oss-radar venv
+    if not venv_paths:
+        venv_paths = [{"path": "~/ghost-ops/oss-radar/.venv", "imports": ["pydantic", "typer"]}]
+
+    for entry in venv_paths:
+        venv_dir = Path(os.path.expanduser(entry.get("path", "")))
+        imports = entry.get("imports", [])
+
+        python = venv_dir / "bin" / "python"
+        if not python.exists():
+            findings.append(Finding(
+                "WARN", "venv_health", None,
+                f"Venv Python not found: {python}",
+            ))
+            continue
+
+        for module in imports:
+            rc, _ = await _shell(f"{python} -c 'import {module}' 2>&1")
+            if rc != 0:
+                findings.append(Finding(
+                    "CRITICAL", "venv_health", None,
+                    f"Venv {venv_dir.name} cannot import '{module}' — likely broken by Python upgrade",
+                ))
+
+    return findings
+
+# ---------------------------------------------------------------------------
 # Mission entry point
 # ---------------------------------------------------------------------------
 
@@ -574,23 +764,47 @@ async def run(ctx: Any) -> dict[str, Any]:
 
     log.info("[sentinel] Starting health check across %d repos", len(repos))
 
-    # Run all checks concurrently
-    results = await asyncio.gather(
-        _check_actions_health(repos, ctx.dry_run, thresholds),
-        _check_daemon_liveness(full_config, ctx.dry_run, thresholds),
-        _check_data_freshness(data_freshness_entries, ctx.dry_run),
-        _check_config_sanity(full_config, config_path, ctx.dry_run),
-        _check_file_drift(full_config, ctx.dry_run),
-        _check_secret_alignment(repos, ctx.dry_run),
-        return_exceptions=True,
-    )
+    # Pre-flight: check gh auth first — if dead, skip API-dependent checks
+    auth_findings = await _check_gh_auth(ctx.dry_run)
+    auth_dead = any(f.severity == "CRITICAL" for f in auth_findings)
 
-    check_names = [
-        "actions_health", "daemon_liveness", "data_freshness",
-        "config_sanity", "file_drift", "secret_alignment",
-    ]
+    if auth_dead and not ctx.dry_run:
+        log.warning("[sentinel] gh auth is dead — skipping API-dependent checks")
+        # Only run local checks that don't need gh
+        results = await asyncio.gather(
+            _check_daemon_liveness(full_config, ctx.dry_run, thresholds),
+            _check_config_sanity(full_config, config_path, ctx.dry_run),
+            _check_file_drift(full_config, ctx.dry_run),
+            _prune_db(full_config, ctx.dry_run),
+            _check_agent_quality(full_config, ctx.dry_run),
+            _check_venv_health(full_config, ctx.dry_run),
+            return_exceptions=True,
+        )
+        check_names = [
+            "daemon_liveness", "config_sanity", "file_drift",
+            "db_pruning", "agent_quality", "venv_health",
+        ]
+    else:
+        # Full check suite
+        results = await asyncio.gather(
+            _check_actions_health(repos, ctx.dry_run, thresholds),
+            _check_daemon_liveness(full_config, ctx.dry_run, thresholds),
+            _check_data_freshness(data_freshness_entries, ctx.dry_run),
+            _check_config_sanity(full_config, config_path, ctx.dry_run),
+            _check_file_drift(full_config, ctx.dry_run),
+            _check_secret_alignment(repos, ctx.dry_run),
+            _prune_db(full_config, ctx.dry_run),
+            _check_agent_quality(full_config, ctx.dry_run),
+            _check_venv_health(full_config, ctx.dry_run),
+            return_exceptions=True,
+        )
+        check_names = [
+            "actions_health", "daemon_liveness", "data_freshness",
+            "config_sanity", "file_drift", "secret_alignment",
+            "db_pruning", "agent_quality", "venv_health",
+        ]
 
-    all_findings: list[Finding] = []
+    all_findings: list[Finding] = list(auth_findings)
     for name, result in zip(check_names, results):
         if isinstance(result, BaseException):
             log.warning("[sentinel] Check '%s' raised: %s", name, result)
@@ -614,8 +828,17 @@ async def run(ctx: Any) -> dict[str, Any]:
     warnings = sum(1 for f in all_findings if f.severity == "WARN")
     info = sum(1 for f in all_findings if f.severity == "INFO")
 
+    # Write heartbeat file so external watchdog can verify sentinel is alive
+    if not ctx.dry_run:
+        try:
+            _HEARTBEAT_PATH.write_text(datetime.now(tz=timezone.utc).isoformat())
+        except OSError:
+            pass
+
+    total_checks = len(check_names) + 1  # +1 for gh_auth
+
     summary = {
-        "checks_run": len(check_names),
+        "checks_run": total_checks,
         "total_findings": len(all_findings),
         "critical": critical,
         "warnings": warnings,
