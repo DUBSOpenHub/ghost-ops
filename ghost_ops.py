@@ -168,6 +168,7 @@ class MissionContext:
     elo: ELORouter
     logger: logging.Logger
     dry_run: bool = False
+    force: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +196,10 @@ _DEFAULT_SCHEDULES = {
 # ---------------------------------------------------------------------------
 
 class GhostOps:
-    def __init__(self, config: dict[str, Any], dry_run: bool = False) -> None:
+    def __init__(self, config: dict[str, Any], dry_run: bool = False, force: bool = False) -> None:
         self.config = config
         self.dry_run = dry_run
+        self.force = force
         self._shutdown = asyncio.Event()
         self.log = logging.getLogger("ghost_ops")
 
@@ -335,6 +337,7 @@ class GhostOps:
             elo=self.elo,
             logger=log,
             dry_run=self.dry_run,
+            force=self.force,
         )
         log.info("Mission started (run_id=%d)", run_id)
         self.llm.reset_token_counters()
@@ -407,6 +410,11 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Override log level (DEBUG|INFO|WARNING|ERROR)",
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Force unsafe overrides (e.g., treat validator failures as approvals).",
+    )
     return p.parse_args()
 
 
@@ -433,7 +441,7 @@ def main() -> None:
 
     _setup_logging(log_level, log_file)
 
-    daemon = GhostOps(config=config, dry_run=args.dry_run)
+    daemon = GhostOps(config=config, dry_run=args.dry_run, force=args.force)
     once = args.once or args.dry_run or bool(args.mission)
 
     try:

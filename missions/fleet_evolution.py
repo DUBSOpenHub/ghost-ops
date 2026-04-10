@@ -334,8 +334,19 @@ async def _validate_mutation(original: str, mutated: str, model: str, ctx: Any, 
         data = json.loads(resp.content)
         return "approved" if data.get("approved") else "rejected"
     except Exception as exc:
-        logger.warning("[fleet_evolution] Validator %s unavailable: %s; defaulting to approved", model, exc)
-        return "approved"
+        if getattr(ctx, "force", False):
+            logger.warning(
+                "[fleet_evolution] Validator %s unavailable: %s; --force set, defaulting to approved",
+                model,
+                exc,
+            )
+            return "approved"
+        logger.warning(
+            "[fleet_evolution] Validator %s unavailable: %s; defaulting to rejected (use --force to override)",
+            model,
+            exc,
+        )
+        return "rejected"
 
 
 async def _get_agent_fitness(agent_path: Path, ctx: Any) -> float:

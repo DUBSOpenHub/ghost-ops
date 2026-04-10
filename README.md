@@ -2,7 +2,7 @@
 
 **Your agents clock in when you clock out.**
 
-Ghost Ops is an autonomous agent operations daemon that runs 24/7 on macOS via `launchd`. Three missions, one brain.
+Ghost Ops is an autonomous agent operations daemon that runs 24/7 on macOS via `launchd`. Four missions, one brain.
 
 ## What It Does
 

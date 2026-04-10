@@ -10,7 +10,13 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from missions.fleet_evolution import _get_sample_task, _ab_test_agent, _resolve_consensus, _xray_score
+from missions.fleet_evolution import (
+    _get_sample_task,
+    _ab_test_agent,
+    _resolve_consensus,
+    _xray_score,
+    _validate_mutation,
+)
 
 
 def run(coro):
@@ -80,6 +86,26 @@ class TestABTestDryRun(unittest.TestCase):
         ctx = self._make_ctx()
         run(_ab_test_agent("orig", "mutated", "task", ctx))
         ctx.llm.complete.assert_not_called()
+
+
+class TestValidateMutationFailClosed(unittest.TestCase):
+    def test_validator_error_defaults_rejected(self) -> None:
+        ctx = MagicMock()
+        ctx.dry_run = False
+        ctx.force = False
+        ctx.llm.complete.side_effect = Exception("validator down")
+
+        result = run(_validate_mutation("orig", "mut", "model-x", ctx))
+        assert result == "rejected"
+
+    def test_validator_error_force_allows_approved(self) -> None:
+        ctx = MagicMock()
+        ctx.dry_run = False
+        ctx.force = True
+        ctx.llm.complete.side_effect = Exception("validator down")
+
+        result = run(_validate_mutation("orig", "mut", "model-x", ctx))
+        assert result == "approved"
 
 
 class TestConsensusWithAB(unittest.TestCase):
